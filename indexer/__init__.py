@@ -6,7 +6,7 @@ Public API re-exports for the indexer package.
 
 from .index_builder import IndexBuilder
 from .index_schema import (
-    CallEdge,
+    DependencyEdge,
     ClassIndex,
     ClassType,
     DependencyInfo,
@@ -20,7 +20,7 @@ __all__ = [
     "IndexBuilder",
     "RepoIndex",
     "ClassIndex",
-    "CallEdge",
+    "DependencyEdge",
     "ClassType",
     "HttpMethod",
     "EndpointInfo",

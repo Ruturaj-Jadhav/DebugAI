@@ -1,26 +1,30 @@
 """
-index_schema.py
+index_schema.py — v3
 
-Core data contracts for the DebugAI indexer.
-Everything downstream — the investigator agent, the input parser, the output formatter —
-reads from these structures. Change these carefully.
+Changelog v3:
+  - ClassType: added TEST
+  - EndpointInfo: base_path + relative_path + full_paths + handler_method_id
+  - MethodInfo: removed empty `calls` field
+  - DependencyEdge: class-level only (no method-to-method over-generation)
+  - RepoIndex: schema_version="3", renamed find_callers/callees to find_dependencies_of/dependents_of
 """
 
 from dataclasses import dataclass, field
 from typing import Optional
 from enum import Enum
 
+SCHEMA_VERSION = "3"
 
-# ---------------------------------------------------------------------------
-# Enums
-# ---------------------------------------------------------------------------
 
 class ClassType(str, Enum):
     CONTROLLER  = "controller"
     SERVICE     = "service"
     REPOSITORY  = "repository"
-    COMPONENT   = "component"   # @Component — generic Spring bean
-    UNKNOWN     = "unknown"     # Java class with no recognised Spring annotation
+    COMPONENT   = "component"
+    CONFIG      = "config"
+    ENTITY      = "entity"
+    TEST        = "test"
+    UNKNOWN     = "unknown"
 
 
 class HttpMethod(str, Enum):
@@ -29,201 +33,161 @@ class HttpMethod(str, Enum):
     PUT     = "PUT"
     DELETE  = "DELETE"
     PATCH   = "PATCH"
-    ANY     = "ANY"             # @RequestMapping with no method specified
+    ANY     = "ANY"
 
 
-# ---------------------------------------------------------------------------
-# Fine-grained building blocks
-# ---------------------------------------------------------------------------
+class EdgeKind(str, Enum):
+    INFERRED_DEPENDENCY = "inferred_dependency"
+
 
 @dataclass
 class EndpointInfo:
     """
-    A single HTTP endpoint exposed by a controller method.
+    HTTP endpoint on a controller method.
 
-    Example
-    -------
-    @PostMapping("/save")
-    public ResponseEntity<Trade> saveTrade(...) { ... }
+    Paths stored at three levels:
+        base_path     = "/owners/{ownerId}"       from class @RequestMapping
+        relative_path = "/pets/new"               from method @GetMapping
+        full_paths    = ["/owners/{ownerId}/pets/new"]  joined (list for multi-path)
 
-    maps to:
-        http_method  = HttpMethod.POST
-        url_path     = "/api/trade/save"   (base_url + method_path combined)
-        handler_name = "saveTrade"
-        line_number  = 42
+    handler_method_id links to exact MethodInfo:
+        "initCreationForm(Owner,ModelMap)"
     """
-    http_method:  HttpMethod
-    url_path:     str                       # full path including controller base
-    handler_name: str                       # the Java method name
-    line_number:  int
-    parameters:   list[str] = field(default_factory=list)   # raw param type names
+    http_method:       HttpMethod
+    base_path:         str
+    relative_path:     str
+    full_paths:        list[str]
+    handler_name:      str
+    handler_method_id: str
+    line_number:       int
+    parameters:        list[str] = field(default_factory=list)
 
 
 @dataclass
 class MethodInfo:
     """
-    A single method inside any Java class.
-    Used for services, repositories, and non-endpoint controller methods.
+    A method inside any Java class.
+    method_id disambiguates overloads: "findAll()" vs "findAll(Pageable)"
+    Note: calls field removed in v3 — returns in v4 from AST body parsing.
     """
-    name:         str
-    line_number:  int
-    return_type:  str                       = "void"
-    parameters:   list[str]                = field(default_factory=list)
-    calls:        list[str]                = field(default_factory=list)
-    # calls: list of "ClassName.methodName" strings this method invokes
-    # populated during call graph building — empty at parse time
+    name:        str
+    method_id:   str
+    line_number: int
+    return_type: str        = "void"
+    parameters:  list[str] = field(default_factory=list)
 
 
 @dataclass
 class DependencyInfo:
     """
-    A field-level dependency injected via @Autowired or constructor injection.
-
-    Example
-    -------
-    @Autowired
-    private TradeService tradeService;
-
-    maps to:
-        class_name  = "TradeService"
-        field_name  = "tradeService"
+    An injected dependency field on a class.
+    dependency_kind: "autowired" | "constructor" | "unknown"
     """
-    class_name:  str
-    field_name:  str
+    class_name:      str
+    field_name:      str
+    dependency_kind: str = "autowired"
 
-
-# ---------------------------------------------------------------------------
-# Per-class index entry
-# ---------------------------------------------------------------------------
 
 @dataclass
 class ClassIndex:
     """
-    Everything we know about a single Java class.
-    One ClassIndex per .java file (we assume one top-level class per file,
-    which is standard Java convention).
+    Everything we know about a single Java class or interface.
+    source_set: "main" | "test" | "other"
+    class_type is forced to TEST when source_set == "test".
     """
     class_name:   str
-    file_path:    str                       # absolute path on disk
+    file_path:    str
     class_type:   ClassType
-    package:      str                       = ""
+    package:      str                   = ""
+    source_set:   str                   = "main"
+    base_url:     str                   = ""
+    endpoints:    list[EndpointInfo]    = field(default_factory=list)
+    methods:      list[MethodInfo]      = field(default_factory=list)
+    dependencies: list[DependencyInfo]  = field(default_factory=list)
+    annotations:  list[str]            = field(default_factory=list)
 
-    # Controller-specific
-    base_url:     str                       = ""    # from @RequestMapping at class level
-    endpoints:    list[EndpointInfo]        = field(default_factory=list)
-
-    # All classes
-    methods:      list[MethodInfo]          = field(default_factory=list)
-    dependencies: list[DependencyInfo]      = field(default_factory=list)
-    # dependencies = @Autowired / constructor-injected fields
-
-    annotations:  list[str]                = field(default_factory=list)
-    # raw annotation names e.g. ["RestController", "RequestMapping"]
-
-
-# ---------------------------------------------------------------------------
-# Call graph
-# ---------------------------------------------------------------------------
 
 @dataclass
-class CallEdge:
+class DependencyEdge:
     """
-    A directed edge in the call graph.
-
-    caller_class.caller_method → callee_class.callee_method
+    Class-level dependency: caller_class depends on callee_class via field_name.
+    Intentionally NOT method-level — that requires AST body parsing (v4).
 
     Example:
-        TradeController.saveTrade → TradeService.save
+        OwnerController → OwnerRepository via "ownerRepository"
+        Agent reads: "when debugging OwnerController, check OwnerRepository"
     """
-    caller_class:  str
-    caller_method: str
-    callee_class:  str
-    callee_method: str
+    caller_class: str
+    callee_class: str
+    field_name:   str
+    edge_kind:    str = EdgeKind.INFERRED_DEPENDENCY
 
-
-# ---------------------------------------------------------------------------
-# Top-level repo index  (this is what gets saved to disk as JSON)
-# ---------------------------------------------------------------------------
 
 @dataclass
 class RepoIndex:
     """
-    The complete index for a single Java repository.
-    Built once, cached to disk, queried many times.
-
-    Query patterns the investigator agent will use:
-        - find_by_endpoint("/api/trade/save")   → ClassIndex (controller)
-        - find_by_class_name("TradeService")    → ClassIndex
-        - find_callers("TradeService", "save")  → list[CallEdge]
-        - find_callees("TradeController", "saveTrade") → list[CallEdge]
-        - search_by_keyword("trade")            → list[ClassIndex]
+    Complete index for a Java repo. Built once, cached to disk.
+    schema_version triggers cache rebuild when schema changes.
     """
-    repo_path:      str
-    classes:        list[ClassIndex]    = field(default_factory=list)
-    call_edges:     list[CallEdge]      = field(default_factory=list)
-    indexed_at:     str                 = ""    # ISO timestamp, set by index_builder
+    repo_path:          str
+    schema_version:     str                     = SCHEMA_VERSION
+    classes:            list[ClassIndex]        = field(default_factory=list)
+    dependency_edges:   list[DependencyEdge]    = field(default_factory=list)
+    indexed_at:         str                     = ""
 
-    # ---------------------------------------------------------------------------
-    # Query helpers — used by the investigator agent, not by the parser
-    # ---------------------------------------------------------------------------
+    def prod_classes(self) -> list[ClassIndex]:
+        return [c for c in self.classes if c.source_set == "main"]
+
+    def test_classes(self) -> list[ClassIndex]:
+        return [c for c in self.classes if c.source_set == "test"]
 
     def find_by_endpoint(self, url_fragment: str) -> list[ClassIndex]:
-        """
-        Return controllers whose endpoints contain url_fragment.
-        Case-insensitive partial match.
-
-        find_by_endpoint("trade/save") matches "/api/trade/save"
-        """
-        results = []
+        """Find controllers matching url_fragment across all full_paths."""
+        results  = []
         fragment = url_fragment.lower()
-        for cls in self.classes:
+        for cls in self.prod_classes():
             if cls.class_type != ClassType.CONTROLLER:
                 continue
             for ep in cls.endpoints:
-                if fragment in ep.url_path.lower():
+                if any(fragment in p.lower() for p in ep.full_paths):
                     results.append(cls)
                     break
         return results
 
     def find_by_class_name(self, name: str) -> Optional[ClassIndex]:
-        """Exact class name lookup. Returns first match."""
         for cls in self.classes:
             if cls.class_name == name:
                 return cls
         return None
 
-    def find_by_type(self, class_type: ClassType) -> list[ClassIndex]:
-        """Return all classes of a given type."""
-        return [c for c in self.classes if c.class_type == class_type]
+    def find_by_type(self, class_type: ClassType, prod_only: bool = True) -> list[ClassIndex]:
+        source = self.prod_classes() if prod_only else self.classes
+        return [c for c in source if c.class_type == class_type]
 
-    def find_callers(self, class_name: str, method_name: str) -> list[CallEdge]:
-        """Who calls class_name.method_name?"""
-        return [
-            e for e in self.call_edges
-            if e.callee_class == class_name and e.callee_method == method_name
-        ]
+    def find_dependencies_of(self, class_name: str) -> list[DependencyEdge]:
+        """What does class_name depend on? (outgoing edges)"""
+        return [e for e in self.dependency_edges if e.caller_class == class_name]
 
-    def find_callees(self, class_name: str, method_name: str) -> list[CallEdge]:
-        """What does class_name.method_name call?"""
-        return [
-            e for e in self.call_edges
-            if e.caller_class == class_name and e.caller_method == method_name
-        ]
+    def find_dependents_of(self, class_name: str) -> list[DependencyEdge]:
+        """Which classes depend on class_name? (incoming edges)"""
+        return [e for e in self.dependency_edges if e.callee_class == class_name]
 
-    def search_by_keyword(self, keyword: str) -> list[ClassIndex]:
+    def search_by_keyword(self, keyword: str, prod_only: bool = True) -> list[ClassIndex]:
         """
-        Fuzzy keyword search across class names, method names, and endpoint URLs.
-        Used by business mode — 'Trade Entry' → finds TradeController, TradeService.
+        Scored keyword search across class names, method names, endpoint paths.
+        Business mode entry point: "Trade Entry" → TradeController, TradeService
+        Scores: class name +3, full_path +2, handler/method name +1
         """
         keyword = keyword.lower()
+        source  = self.prod_classes() if prod_only else self.classes
         results = []
-        seen = set()
-        for cls in self.classes:
+        seen    = set()
+        for cls in source:
             score = 0
             if keyword in cls.class_name.lower():
                 score += 3
             for ep in cls.endpoints:
-                if keyword in ep.url_path.lower():
+                if any(keyword in p.lower() for p in ep.full_paths):
                     score += 2
                 if keyword in ep.handler_name.lower():
                     score += 1

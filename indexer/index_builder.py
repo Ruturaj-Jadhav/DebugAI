@@ -1,38 +1,25 @@
 """
-index_builder.py
+index_builder.py — v3
 
-Orchestrates the full repo indexing process.
-
-Responsibilities:
-  1. Walk the repo directory recursively
-  2. Find all .java files
-  3. Parse each with java_parser
-  4. Build call graph from dependency info
-  5. Save RepoIndex to disk as JSON
-  6. Load cached index on subsequent runs
-
-Usage:
-    from indexer.index_builder import IndexBuilder
-
-    builder = IndexBuilder("/path/to/repo")
-    index = builder.build()           # full scan + save
-    index = builder.load()            # load from cache
-    index = builder.get_or_build()    # load if fresh, build if stale
+Fixes in v3:
+  - DependencyEdge is now class-level only (caller_class → callee_class + field_name)
+  - No more method-to-method over-generation or duplicates
+  - schema_version check on cache load triggers rebuild if stale
+  - Serialisation updated for all v3 schema fields
 """
 
 import json
 import os
 from datetime import datetime, timezone
-from dataclasses import asdict
 from pathlib import Path
 
 from .java_parser import parse_java_file
 from .index_schema import (
-    RepoIndex, ClassIndex, ClassType, CallEdge,
-    EndpointInfo, MethodInfo, DependencyInfo, HttpMethod
+    RepoIndex, ClassIndex, ClassType, DependencyEdge,
+    EndpointInfo, MethodInfo, DependencyInfo, HttpMethod,
+    SCHEMA_VERSION
 )
 
-# Cache file sits at repo root
 _INDEX_FILENAME = ".debugai_index.json"
 
 
@@ -47,51 +34,53 @@ class IndexBuilder:
     # ------------------------------------------------------------------
 
     def build(self) -> RepoIndex:
-        """
-        Full scan: walk every .java file, parse it, build index, save to disk.
-        Always rebuilds even if cache exists.
-        """
+        """Full scan, parse, build, save. Always rebuilds."""
         print(f"[indexer] Scanning {self.repo_path}")
 
         java_files = self._find_java_files()
         print(f"[indexer] Found {len(java_files)} .java files")
 
         classes = self._parse_all(java_files)
-        print(f"[indexer] Parsed {len(classes)} classes")
+        prod    = sum(1 for c in classes if c.source_set == "main")
+        tests   = sum(1 for c in classes if c.source_set == "test")
+        print(f"[indexer] Parsed {len(classes)} classes ({prod} prod, {tests} test)")
 
-        call_edges = self._build_call_graph(classes)
-        print(f"[indexer] Built call graph: {len(call_edges)} edges")
+        # Class type breakdown
+        from collections import Counter
+        type_counts = Counter(c.class_type.value for c in classes if c.source_set == "main")
+        print(f"[indexer] Prod types: {dict(type_counts)}")
+
+        dep_edges = self._build_dependency_edges(classes)
+        print(f"[indexer] Built {len(dep_edges)} class-level dependency edges")
 
         index = RepoIndex(
-            repo_path   = self.repo_path,
-            classes     = classes,
-            call_edges  = call_edges,
-            indexed_at  = datetime.now(timezone.utc).isoformat(),
+            repo_path        = self.repo_path,
+            schema_version   = SCHEMA_VERSION,
+            classes          = classes,
+            dependency_edges = dep_edges,
+            indexed_at       = datetime.now(timezone.utc).isoformat(),
         )
 
         self._save(index)
-        print(f"[indexer] Index saved to {self.index_file}")
-
+        print(f"[indexer] Saved -> {self.index_file}")
         return index
 
     def load(self) -> RepoIndex | None:
-        """
-        Load index from disk cache.
-        Returns None if no cache exists.
-        """
         if not Path(self.index_file).exists():
             return None
         return self._load()
 
     def get_or_build(self) -> RepoIndex:
-        """
-        Load from cache if it exists, otherwise build fresh.
-        This is what the CLI will call on startup.
-        """
+        """Load from cache if schema matches, else rebuild."""
         cached = self.load()
         if cached is not None:
-            print(f"[indexer] Loaded cached index ({cached.indexed_at})")
-            print(f"[indexer] {len(cached.classes)} classes, {len(cached.call_edges)} call edges")
+            if cached.schema_version != SCHEMA_VERSION:
+                print(f"[indexer] Cache schema v{cached.schema_version} → current v{SCHEMA_VERSION}, rebuilding...")
+                return self.build()
+            prod  = sum(1 for c in cached.classes if c.source_set == "main")
+            tests = sum(1 for c in cached.classes if c.source_set == "test")
+            print(f"[indexer] Cache loaded ({cached.indexed_at})")
+            print(f"[indexer] {len(cached.classes)} classes ({prod} prod, {tests} test), {len(cached.dependency_edges)} edges")
             return cached
         return self.build()
 
@@ -100,24 +89,16 @@ class IndexBuilder:
     # ------------------------------------------------------------------
 
     def _find_java_files(self) -> list[str]:
-        """
-        Recursively find all .java files in the repo.
-        Skips common non-source directories.
-        """
         skip_dirs = {
             "target", "build", ".git", ".idea",
             "node_modules", "out", "generated-sources"
         }
         java_files = []
-
         for root, dirs, files in os.walk(self.repo_path):
-            # Prune directories we should never scan
             dirs[:] = [d for d in dirs if d not in skip_dirs]
-
             for file in files:
                 if file.endswith(".java"):
                     java_files.append(os.path.join(root, file))
-
         return sorted(java_files)
 
     # ------------------------------------------------------------------
@@ -125,12 +106,8 @@ class IndexBuilder:
     # ------------------------------------------------------------------
 
     def _parse_all(self, java_files: list[str]) -> list[ClassIndex]:
-        """
-        Parse all java files. Skip files that fail or return None.
-        """
         classes = []
         failed  = 0
-
         for file_path in java_files:
             try:
                 result = parse_java_file(file_path)
@@ -138,82 +115,53 @@ class IndexBuilder:
                     classes.append(result)
             except Exception as e:
                 failed += 1
-                print(f"[indexer] WARN: Could not parse {file_path}: {e}")
-
+                print(f"[indexer] WARN: Could not parse {Path(file_path).name}: {e}")
         if failed:
-            print(f"[indexer] {failed} files could not be parsed and were skipped")
-
+            print(f"[indexer] {failed} files skipped due to parse errors")
         return classes
 
     # ------------------------------------------------------------------
-    # Call graph
+    # Dependency edges — CLASS LEVEL ONLY
     # ------------------------------------------------------------------
 
-    def _build_call_graph(self, classes: list[ClassIndex]) -> list[CallEdge]:
+    def _build_dependency_edges(self, classes: list[ClassIndex]) -> list[DependencyEdge]:
         """
-        Build call edges from dependency relationships.
-
-        Strategy:
-          For each class, look at its @Autowired dependencies.
-          For each dependency, find the matching ClassIndex.
-          For each method in the current class, link it to the
-          public methods of the dependency.
-
-        This is a structural inference — we don't parse method bodies
-        to find actual call sites. Instead we infer: if TradeController
-        has TradeService injected, then TradeController's methods
-        CAN call TradeService's methods.
-
-        True call-site parsing requires method body analysis and is v2.
-        For MVP this gives us the dependency chain which is what matters.
+        One edge per (caller_class, callee_class, field_name) tuple.
+        Production classes only — test dependencies excluded.
+        No method-to-method inference — that is v4 (AST body parsing).
         """
-        # Build lookup map: class_name -> ClassIndex
-        class_map = {cls.class_name: cls for cls in classes}
+        prod_classes = [c for c in classes if c.source_set == "main"]
+        class_names  = {cls.class_name for cls in prod_classes}
+        edges        = []
+        seen         = set()
 
-        edges = []
-
-        for cls in classes:
+        for cls in prod_classes:
             for dep in cls.dependencies:
-                dep_class = class_map.get(dep.class_name)
-                if dep_class is None:
-                    # Dependency not in repo (external library etc) — skip
+                # Only link to classes that exist in this repo
+                if dep.class_name not in class_names:
                     continue
-
-                # Link each method in this class to each method in dependency
-                # For controllers: use endpoint handler names
-                caller_methods = (
-                    [ep.handler_name for ep in cls.endpoints]
-                    + [m.name for m in cls.methods]
-                )
-
-                callee_methods = (
-                    [m.name for m in dep_class.methods]
-                    + [ep.handler_name for ep in dep_class.endpoints]
-                )
-
-                for caller_method in caller_methods:
-                    for callee_method in callee_methods:
-                        edges.append(CallEdge(
-                            caller_class  = cls.class_name,
-                            caller_method = caller_method,
-                            callee_class  = dep_class.class_name,
-                            callee_method = callee_method,
-                        ))
+                key = (cls.class_name, dep.class_name, dep.field_name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                edges.append(DependencyEdge(
+                    caller_class = cls.class_name,
+                    callee_class = dep.class_name,
+                    field_name   = dep.field_name,
+                ))
 
         return edges
 
     # ------------------------------------------------------------------
-    # Serialisation — save and load
+    # Serialisation
     # ------------------------------------------------------------------
 
     def _save(self, index: RepoIndex) -> None:
-        """Serialise RepoIndex to JSON and write to disk."""
         data = _serialise(index)
         with open(self.index_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
 
     def _load(self) -> RepoIndex:
-        """Load RepoIndex from JSON cache on disk."""
         with open(self.index_file, "r", encoding="utf-8") as f:
             data = json.load(f)
         return _deserialise(data)
@@ -224,19 +172,19 @@ class IndexBuilder:
 # ------------------------------------------------------------------
 
 def _serialise(index: RepoIndex) -> dict:
-    """Convert RepoIndex to a plain dict for JSON serialisation."""
     return {
-        "repo_path":  index.repo_path,
-        "indexed_at": index.indexed_at,
-        "classes":    [_serialise_class(c) for c in index.classes],
-        "call_edges": [
+        "schema_version":   index.schema_version,
+        "repo_path":        index.repo_path,
+        "indexed_at":       index.indexed_at,
+        "classes":          [_serialise_class(c) for c in index.classes],
+        "dependency_edges": [
             {
-                "caller_class":  e.caller_class,
-                "caller_method": e.caller_method,
-                "callee_class":  e.callee_class,
-                "callee_method": e.callee_method,
+                "caller_class": e.caller_class,
+                "callee_class": e.callee_class,
+                "field_name":   e.field_name,
+                "edge_kind":    e.edge_kind,
             }
-            for e in index.call_edges
+            for e in index.dependency_edges
         ],
     }
 
@@ -247,32 +195,37 @@ def _serialise_class(cls: ClassIndex) -> dict:
         "file_path":    cls.file_path,
         "class_type":   cls.class_type.value,
         "package":      cls.package,
+        "source_set":   cls.source_set,
         "base_url":     cls.base_url,
         "annotations":  cls.annotations,
         "endpoints": [
             {
-                "http_method":  ep.http_method.value,
-                "url_path":     ep.url_path,
-                "handler_name": ep.handler_name,
-                "line_number":  ep.line_number,
-                "parameters":   ep.parameters,
+                "http_method":       ep.http_method.value,
+                "base_path":         ep.base_path,
+                "relative_path":     ep.relative_path,
+                "full_paths":        ep.full_paths,
+                "handler_name":      ep.handler_name,
+                "handler_method_id": ep.handler_method_id,
+                "line_number":       ep.line_number,
+                "parameters":        ep.parameters,
             }
             for ep in cls.endpoints
         ],
         "methods": [
             {
                 "name":        m.name,
+                "method_id":   m.method_id,
                 "line_number": m.line_number,
                 "return_type": m.return_type,
                 "parameters":  m.parameters,
-                "calls":       m.calls,
             }
             for m in cls.methods
         ],
         "dependencies": [
             {
-                "class_name": d.class_name,
-                "field_name": d.field_name,
+                "class_name":      d.class_name,
+                "field_name":      d.field_name,
+                "dependency_kind": d.dependency_kind,
             }
             for d in cls.dependencies
         ],
@@ -281,20 +234,21 @@ def _serialise_class(cls: ClassIndex) -> dict:
 
 def _deserialise(data: dict) -> RepoIndex:
     classes = [_deserialise_class(c) for c in data.get("classes", [])]
-    call_edges = [
-        CallEdge(
-            caller_class  = e["caller_class"],
-            caller_method = e["caller_method"],
-            callee_class  = e["callee_class"],
-            callee_method = e["callee_method"],
+    edges = [
+        DependencyEdge(
+            caller_class = e["caller_class"],
+            callee_class = e["callee_class"],
+            field_name   = e["field_name"],
+            edge_kind    = e.get("edge_kind", "inferred_dependency"),
         )
-        for e in data.get("call_edges", [])
+        for e in data.get("dependency_edges", [])
     ]
     return RepoIndex(
-        repo_path  = data["repo_path"],
-        indexed_at = data.get("indexed_at", ""),
-        classes    = classes,
-        call_edges = call_edges,
+        schema_version   = data.get("schema_version", "1"),
+        repo_path        = data["repo_path"],
+        indexed_at       = data.get("indexed_at", ""),
+        classes          = classes,
+        dependency_edges = edges,
     )
 
 
@@ -304,32 +258,37 @@ def _deserialise_class(data: dict) -> ClassIndex:
         file_path   = data["file_path"],
         class_type  = ClassType(data["class_type"]),
         package     = data.get("package", ""),
+        source_set  = data.get("source_set", "main"),
         base_url    = data.get("base_url", ""),
         annotations = data.get("annotations", []),
         endpoints=[
             EndpointInfo(
-                http_method  = HttpMethod(ep["http_method"]),
-                url_path     = ep["url_path"],
-                handler_name = ep["handler_name"],
-                line_number  = ep["line_number"],
-                parameters   = ep.get("parameters", []),
+                http_method       = HttpMethod(ep["http_method"]),
+                base_path         = ep.get("base_path", ""),
+                relative_path     = ep.get("relative_path", ""),
+                full_paths        = ep.get("full_paths", [ep.get("url_path", "/")]),
+                handler_name      = ep["handler_name"],
+                handler_method_id = ep.get("handler_method_id", ep["handler_name"] + "()"),
+                line_number       = ep["line_number"],
+                parameters        = ep.get("parameters", []),
             )
             for ep in data.get("endpoints", [])
         ],
         methods=[
             MethodInfo(
                 name        = m["name"],
+                method_id   = m.get("method_id", m["name"] + "()"),
                 line_number = m["line_number"],
                 return_type = m.get("return_type", "void"),
                 parameters  = m.get("parameters", []),
-                calls       = m.get("calls", []),
             )
             for m in data.get("methods", [])
         ],
         dependencies=[
             DependencyInfo(
-                class_name = d["class_name"],
-                field_name = d["field_name"],
+                class_name      = d["class_name"],
+                field_name      = d["field_name"],
+                dependency_kind = d.get("dependency_kind", "autowired"),
             )
             for d in data.get("dependencies", [])
         ],
