@@ -1,2 +1,24 @@
-tree-sitter
-tree-sitter-java
+# DebugAI — requirements.txt
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# API key setup (pick one):
+#   set OPENROUTER_API_KEY=your_key    (Windows)
+#   export OPENROUTER_API_KEY=your_key (Mac/Linux)
+#
+# Free API key at: https://openrouter.ai
+
+# ── LLM + Agent framework ─────────────────────────────────────────────
+openai>=1.0.0                # OpenAI-compatible client (used for OpenRouter/NVIDIA NIM)
+langgraph>=0.2.0             # Agent graph orchestration
+langchain>=0.3.0             # LangChain core (LangGraph dependency)
+langchain-core>=0.3.0        # LangChain primitives
+langchain-openai>=0.2.0      # OpenAI integration for LangChain
+
+# ── Java AST parsing ──────────────────────────────────────────────────
+tree-sitter>=0.23.0          # AST parser core
+tree-sitter-java>=0.23.0     # Java grammar for tree-sitter
+
+# ── Optional: Groq (alternative free LLM provider) ───────────────────
+# groq>=0.9.0                # Uncomment if using Groq instead of OpenRouter
